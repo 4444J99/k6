@@ -108,6 +108,45 @@ func getCmdForExtension(extension *ext.Extension, gs *state.GlobalState) *cobra.
 	return cmd
 }
 
+// extensionCompletionDeps checks whether CmdArgs represent a shell completion request
+// for an unregistered extension subcommand (e.g. k6 __complete x docs "").
+// Returns the dependencies to provision, or nil if this is not such a request.
+func extensionCompletionDeps(gs *state.GlobalState) dependencies {
+	if !gs.Flags.AutoExtensionResolution {
+		return nil
+	}
+
+	// k6 __complete x <extName> <arg...>
+	// [0] [1]        [2] [3]     [4]+
+	args := gs.CmdArgs
+	if len(args) < 5 {
+		return nil
+	}
+	if args[1] != cobra.ShellCompRequestCmd && args[1] != cobra.ShellCompNoDescRequestCmd {
+		return nil
+	}
+	if args[2] != "x" {
+		return nil
+	}
+	extName := args[3]
+
+	// If the extension is already registered, cobra handles it. Nothing to do.
+	for _, ext := range ext.Get(ext.SubcommandExtension) {
+		if ext.Name == extName {
+			return nil
+		}
+	}
+
+	// Not registered. Provision a binary with this extension to get the completions.
+	deps, err := dependenciesFromSubcommand(gs, extName)
+	if err != nil {
+		gs.Logger.WithError(err).Debugf("completion: failed to build dependencies for %q", extName)
+		return nil
+	}
+
+	return deps
+}
+
 // dependenciesFromSubcommand constructs a dependencies object for the given subcommand,
 // potentially using the manifest file specified in the global state.
 //
