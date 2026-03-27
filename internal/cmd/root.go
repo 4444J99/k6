@@ -175,6 +175,19 @@ func (c *rootCommand) execute() {
 		}
 	}()
 
+	// If this is a shell completion for an unregistered extension subcommand,
+	// provision the binary and let it handle the completion request directly.
+	if deps := extensionCompletionDeps(c.globalState); deps != nil {
+		derr := binaryIsNotSatisfyingDependenciesError{deps: deps}
+		ec, herr := handleUnsatisfiedDependencies(derr, c)
+		if herr != nil {
+			// handleUnsatisfiedDependencies already logged the error.
+			return
+		}
+		exitCode = int(ec)
+		return
+	}
+
 	err := c.cmd.Execute()
 	if err == nil {
 		exitCode = 0
