@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"maps"
 	"sync"
 	"testing"
 
@@ -133,6 +134,82 @@ func Test_dependenciesFromSubcommand(t *testing.T) {
 		require.Error(t, err)
 		require.Nil(t, deps)
 	})
+}
+
+func Test_extensionCompletionDeps(t *testing.T) {
+	t.Parallel()
+
+	registerTestSubcommandExtensions(t)
+
+	tt := []struct {
+		name string
+		args []string
+		env  map[string]string
+		want bool
+	}{
+		{
+			name: "partial name single char",
+			args: []string{"k6", "__complete", "x", "d"},
+		},
+		{
+			name: "partial name without trailing space",
+			args: []string{"k6", "__complete", "x", "docs"},
+		},
+		{
+			name: "not a completion request",
+			args: []string{"k6", "x", "docs", ""},
+		},
+		{
+			name: "completion not targeting x",
+			args: []string{"k6", "__complete", "run", "script.js", ""},
+		},
+		{
+			name: "auto resolution disabled",
+			args: []string{"k6", "__complete", "x", "unknown-ext", ""},
+			env:  map[string]string{"K6_AUTO_EXTENSION_RESOLUTION": "false"},
+		},
+		{
+			name: "registered extension handled by cobra",
+			args: []string{"k6", "__complete", "x", "test-cmd-1", ""},
+		},
+		{
+			name: "unregistered extension with committed name",
+			args: []string{"k6", "__complete", "x", "docs", ""},
+			want: true,
+		},
+		{
+			name: "unregistered extension with deeper args",
+			args: []string{"k6", "__complete", "x", "docs", "http", ""},
+			want: true,
+		},
+		{
+			name: "__completeNoDesc variant",
+			args: []string{"k6", "__completeNoDesc", "x", "docs", ""},
+			want: true,
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ts := tests.NewGlobalTestState(t)
+			ts.CmdArgs = tc.args
+			maps.Copy(ts.Env, tc.env)
+			if len(tc.env) > 0 {
+				ts.ReparseFlags()
+			}
+
+			deps := extensionCompletionDeps(ts.GlobalState)
+
+			if !tc.want {
+				require.Nil(t, deps)
+				return
+			}
+			require.NotNil(t, deps)
+			require.Contains(t, deps, "subcommand:docs")
+		})
+	}
 }
 
 var registerTestSubcommandExtensionsOnce sync.Once //nolint:gochecknoglobals
