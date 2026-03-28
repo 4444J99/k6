@@ -1,9 +1,12 @@
 package cloudapi
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"time"
 
@@ -47,7 +50,10 @@ func NewClient(logger logrus.FieldLogger, token, host, version string, timeout t
 			},
 		},
 		OperationServers: map[string]k6cloud.ServerConfigurations{},
-		HTTPClient:       &http.Client{Timeout: timeout},
+		HTTPClient: &http.Client{
+			Timeout:   timeout,
+			Transport: &idempotencyTransport{base: http.DefaultTransport},
+		},
 	}
 
 	c := &Client{
@@ -62,8 +68,13 @@ func NewClient(logger logrus.FieldLogger, token, host, version string, timeout t
 }
 
 // SetStackID sets the stack ID for the client.
-func (c *Client) SetStackID(stackID int64) {
+// It returns an error if the value overflows int32.
+func (c *Client) SetStackID(stackID int64) error {
+	if stackID < 0 || stackID > math.MaxInt32 {
+		return fmt.Errorf("stack ID %d is out of valid int32 range [0, %d]", stackID, math.MaxInt32)
+	}
 	c.stackID = stackID
+	return nil
 }
 
 // BaseURL returns configured host.
@@ -105,4 +116,31 @@ func CheckResponse(r *http.Response) error {
 	}
 	payload.Response = r
 	return payload
+}
+
+const k6IdempotencyKeyHeader = "K6-Idempotency-Key"
+
+// idempotencyTransport wraps an http.RoundTripper to inject
+// a unique K6-Idempotency-Key header on mutation requests.
+type idempotencyTransport struct {
+	base http.RoundTripper
+}
+
+func (t *idempotencyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	switch req.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		// read-only — no idempotency key needed
+	default:
+		if req.Header.Get(k6IdempotencyKeyHeader) == "" {
+			req.Header.Set(k6IdempotencyKeyHeader, randomStrHex())
+		}
+	}
+	return t.base.RoundTrip(req)
+}
+
+// randomStrHex returns a 16-character hex string from crypto/rand.
+func randomStrHex() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
