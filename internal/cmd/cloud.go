@@ -1,10 +1,13 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -12,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	k6cloud "github.com/grafana/k6-cloud-openapi-client-go/k6"
 	"gopkg.in/guregu/null.v3"
 
 	"go.k6.io/k6/cloudapi"
@@ -19,10 +23,12 @@ import (
 	"go.k6.io/k6/errext"
 	"go.k6.io/k6/errext/exitcodes"
 	"go.k6.io/k6/internal/build"
+	cloudapiv6 "go.k6.io/k6/internal/cloudapi/v6"
 	"go.k6.io/k6/internal/ui/pb"
 	"go.k6.io/k6/lib"
 
 	"github.com/fatih/color"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -182,14 +188,21 @@ func (c *cmdCloud) run(cmd *cobra.Command, args []string) error {
 
 	logger := c.gs.Logger
 
-	// Start cloud test run
-	modifyAndPrintBar(c.gs, progressBar, pb.WithConstProgress(0, "Validating script options"))
-	client := cloudapi.NewClient(
-		logger, cloudConfig.Token.String, cloudConfig.Host.String, build.Version, cloudConfig.Timeout.TimeDuration())
-	if cloudConfig.StackID.Valid {
-		client.SetStackID(cloudConfig.StackID.Int64)
+	// StackID is required for the v6 cloud API
+	if !cloudConfig.StackID.Valid || cloudConfig.StackID.Int64 == 0 {
+		//nolint:staticcheck
+		return errors.New("StackID is required to run tests in Grafana Cloud." +
+			" Run `k6 cloud login` to configure your stack," +
+			" or set the K6_CLOUD_STACK_ID environment variable.")
 	}
-	if err = client.ValidateOptions(arc.Options); err != nil {
+
+	// Create v6 cloud API client
+	v6Client, err := cloudapiv6.NewClient(
+		logger, cloudConfig.Token.String, cloudConfig.Hostv6.String, build.Version, cloudConfig.Timeout.TimeDuration())
+	if err != nil {
+		return err
+	}
+	if err := v6Client.SetStackID(cloudConfig.StackID.Int64); err != nil {
 		return err
 	}
 
@@ -199,33 +212,66 @@ func (c *cmdCloud) run(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	modifyAndPrintBar(c.gs, progressBar, pb.WithConstProgress(0, "Uploading archive"))
-
-	var cloudTestRun *cloudapi.CreateTestRunResponse
-	if c.uploadOnly {
-		cloudTestRun, err = client.UploadTestOnly(name, cloudConfig.ProjectID.Int64, arc)
-	} else {
-		cloudTestRun, err = client.StartCloudTestRun(name, cloudConfig.ProjectID.Int64, arc)
+	// Validate script options via v6
+	modifyAndPrintBar(c.gs, progressBar, pb.WithConstProgress(0, "Validating script options"))
+	validateReq, err := buildValidateOptionsRequest(arc.Options, cloudConfig.ProjectID)
+	if err != nil {
+		return err
+	}
+	if err := v6Client.ValidateOptions(globalCtx, validateReq); err != nil {
+		return err
 	}
 
+	// Create load test and upload archive via v6
+	modifyAndPrintBar(c.gs, progressBar, pb.WithConstProgress(0, "Uploading archive"))
+
+	var archiveBuf bytes.Buffer
+	if err := arc.Write(&archiveBuf); err != nil {
+		return err
+	}
+	archiveBytes := archiveBuf.Bytes()
+
+	//nolint:gosec // projectID range validated
+	projectID := int32(cloudConfig.ProjectID.Int64)
+	loadTestID, err := v6Client.CreateLoadTest(
+		globalCtx, projectID, name,
+		io.NopCloser(bytes.NewReader(archiveBytes)))
+	if err != nil {
+		loadTestID, err = c.handleCreateConflict(
+			globalCtx, err, v6Client, logger, projectID, name, archiveBytes)
+		if err != nil {
+			return err
+		}
+	}
+
+	if c.uploadOnly {
+		modifyAndPrintBar(c.gs, progressBar, pb.WithConstProgress(1, "Uploaded"))
+		if !c.gs.Flags.Quiet {
+			valueColor := getColor(c.gs.Flags.NoColor || !c.gs.Stdout.IsTTY, color.FgCyan)
+			printToStdout(c.gs, fmt.Sprintf("     test status: %s\n", valueColor.Sprint("Uploaded")))
+		}
+		return nil
+	}
+
+	// Start test run via v6
+	modifyAndPrintBar(c.gs, progressBar, pb.WithConstProgress(0, "Starting test run"))
+	startResp, err := v6Client.StartTestRun(globalCtx, loadTestID)
 	if err != nil {
 		return err
 	}
 
-	refID := cloudTestRun.ReferenceID
-	if cloudTestRun.ConfigOverride != nil {
-		cloudConfig = cloudConfig.Apply(*cloudTestRun.ConfigOverride)
+	testRunID := startResp.TestRunID
+	testURL := startResp.WebAppURL
+	if testURL == "" {
+		logger.Warn("web_app_url not returned from start response")
 	}
 
 	// Trap Interrupts, SIGINTs and SIGTERMs.
 	gracefulStop := func(sig os.Signal) {
 		logger.WithField("sig", sig).Print("Stopping cloud test run in response to signal...")
-		// Do this in a separate goroutine so that if it blocks, the
-		// second signal can still abort the process execution.
 		go func() {
-			stopErr := client.StopCloudTestRun(refID)
-			if stopErr != nil {
-				logger.WithError(stopErr).Error("Stop cloud test error")
+			if stopErr := v6Client.AbortTestRun(context.Background(), testRunID); stopErr != nil {
+				logger.WithError(stopErr).Error("Abort cloud test error")
 			} else {
 				logger.Info("Successfully sent signal to stop the cloud test, now waiting for it to actually stop...")
 			}
@@ -242,7 +288,6 @@ func (c *cmdCloud) run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	testURL := cloudapi.URLForResults(refID, cloudConfig)
 	executionPlan := test.derivedConfig.Scenarios.GetFullExecutionRequirements(et)
 	printExecutionDescription(
 		c.gs, "cloud", test.sourceRootPath, testURL, test.derivedConfig, et, executionPlan, nil,
@@ -270,7 +315,7 @@ func (c *cmdCloud) run(cmd *cobra.Command, args []string) error {
 	maxDuration, _ = lib.GetEndOffset(executionPlan)
 
 	testProgressLock := &sync.Mutex{}
-	var testProgress *cloudapi.TestProgressResponse
+	var testProgress *cloudapiv6.TestRunProgress
 	progressBar.Modify(
 		pb.WithProgress(func() (float64, []string) {
 			testProgressLock.Lock()
@@ -280,12 +325,9 @@ func (c *cmdCloud) run(cmd *cobra.Command, args []string) error {
 				return 0, []string{"Waiting..."}
 			}
 
-			statusText := testProgress.RunStatusText
+			statusText := titleCaseStatus(testProgress.Status)
 
-			switch testProgress.RunStatus { //nolint:exhaustive
-			case cloudapi.RunStatusFinished:
-				testProgress.Progress = 1
-			case cloudapi.RunStatusRunning:
+			if testProgress.Status == "running" {
 				if startTime.IsZero() {
 					startTime = time.Now()
 				}
@@ -297,11 +339,18 @@ func (c *cmdCloud) run(cmd *cobra.Command, args []string) error {
 				}
 			}
 
-			return testProgress.Progress, []string{statusText}
+			progress := testProgress.Progress()
+			if testProgress.IsTerminal() {
+				progress = 1
+			}
+
+			return progress, []string{statusText}
 		}),
 	)
 
 	ticker := time.NewTicker(time.Millisecond * 2000)
+	defer ticker.Stop()
+	refID := strconv.FormatInt(int64(testRunID), 10)
 	if c.showCloudLogs {
 		go func() {
 			logger.Debug("Connecting to cloud logs server...")
@@ -312,7 +361,7 @@ func (c *cmdCloud) run(cmd *cobra.Command, args []string) error {
 	}
 
 	for range ticker.C {
-		newTestProgress, progressErr := client.GetTestProgress(refID)
+		newTestProgress, progressErr := v6Client.FetchTestRun(globalCtx, testRunID)
 		if progressErr != nil {
 			logger.WithError(progressErr).Error("Test progress error")
 			continue
@@ -322,8 +371,8 @@ func (c *cmdCloud) run(cmd *cobra.Command, args []string) error {
 		testProgress = newTestProgress
 		testProgressLock.Unlock()
 
-		if (newTestProgress.RunStatus > cloudapi.RunStatusRunning) ||
-			(c.exitOnRunning && newTestProgress.RunStatus == cloudapi.RunStatusRunning) {
+		if newTestProgress.IsTerminal() ||
+			(c.exitOnRunning && newTestProgress.Status == "running") {
 			globalCancel()
 			break
 		}
@@ -337,27 +386,97 @@ func (c *cmdCloud) run(cmd *cobra.Command, args []string) error {
 	if !c.gs.Flags.Quiet {
 		valueColor := getColor(c.gs.Flags.NoColor || !c.gs.Stdout.IsTTY, color.FgCyan)
 		printToStdout(c.gs, fmt.Sprintf(
-			"     test status: %s\n", valueColor.Sprint(testProgress.RunStatusText),
+			"     test status: %s\n", valueColor.Sprint(titleCaseStatus(testProgress.Status)),
 		))
 	} else {
-		logger.WithField("run_status", testProgress.RunStatusText).Debug("Test finished")
+		logger.WithField("run_status", testProgress.Status).Debug("Test finished")
 	}
 
-	if testProgress.ResultStatus == cloudapi.ResultStatusFailed {
-		// Although by looking at [ResultStatus] and [RunStatus] isn't self-explanatory,
-		// the scenario when the test run has finished, but it failed is an exceptional case for those situations
-		// when thresholds have been crossed (failed). So, we report this situation as such.
-		if testProgress.RunStatus == cloudapi.RunStatusFinished ||
-			testProgress.RunStatus == cloudapi.RunStatusAbortedThreshold {
+	return c.mapV6ExitCode(testProgress)
+}
+
+// titleCaseStatus converts a snake_case status like "aborted_user" to "Aborted User".
+func titleCaseStatus(s string) string {
+	words := strings.Split(s, "_")
+	for i, w := range words {
+		if len(w) > 0 {
+			words[i] = strings.ToUpper(w[:1]) + w[1:]
+		}
+	}
+	return strings.Join(words, " ")
+}
+
+func (c *cmdCloud) mapV6ExitCode(tp *cloudapiv6.TestRunProgress) error {
+	if tp.Result == "error" {
+		//nolint:staticcheck
+		return errext.WithExitCodeIfNone(errors.New("The test has failed"), exitcodes.CloudTestRunFailed)
+	}
+	if tp.Result == "failed" {
+		if tp.Status == "finished" || tp.Status == "aborted_threshold" {
 			//nolint:staticcheck
 			return errext.WithExitCodeIfNone(errors.New("Thresholds have been crossed"), exitcodes.ThresholdsHaveFailed)
 		}
+		//nolint:staticcheck
+		return errext.WithExitCodeIfNone(errors.New("The test has failed"), exitcodes.CloudTestRunFailed)
+	}
+	return nil
+}
 
-		// TODO: use different exit codes for failed thresholds vs failed test (e.g. aborted by system/limit)
-		return errext.WithExitCodeIfNone(errors.New("The test has failed"), exitcodes.CloudTestRunFailed) //nolint:staticcheck
+// handleCreateConflict handles 409 Conflict from CreateLoadTest by fetching
+// the existing load test by name and updating its script.
+func (c *cmdCloud) handleCreateConflict(
+	ctx context.Context,
+	createErr error,
+	v6Client *cloudapiv6.Client,
+	logger logrus.FieldLogger,
+	projectID int32,
+	name string,
+	archiveBytes []byte,
+) (int32, error) {
+	var respErr cloudapiv6.ResponseError
+	if !errors.As(createErr, &respErr) || respErr.Response == nil ||
+		respErr.Response.StatusCode != http.StatusConflict {
+		return 0, createErr
 	}
 
-	return nil
+	logger.WithField("name", name).Info("Load test already exists, updating script")
+
+	existingID, err := v6Client.GetLoadTestByName(ctx, projectID, name)
+	if err != nil {
+		return 0, fmt.Errorf("load test conflict but could not find existing: %w", err)
+	}
+
+	if err := v6Client.UpdateScript(ctx, existingID, io.NopCloser(bytes.NewReader(archiveBytes))); err != nil {
+		return 0, fmt.Errorf("failed to update existing load test script: %w", err)
+	}
+
+	return existingID, nil
+}
+
+// buildValidateOptionsRequest converts lib.Options into the v6 API
+// ValidateOptionsRequest by JSON round-tripping. Fields not recognized
+// by the OpenAPI Options type end up in AdditionalProperties, which is
+// the desired behavior for server-side validation.
+func buildValidateOptionsRequest(
+	opts lib.Options, projectID null.Int,
+) (*k6cloud.ValidateOptionsRequest, error) {
+	optJSON, err := json.Marshal(opts)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling options for validation: %w", err)
+	}
+
+	var k6Opts k6cloud.Options
+	if err := json.Unmarshal(optJSON, &k6Opts); err != nil {
+		return nil, fmt.Errorf("converting options for validation: %w", err)
+	}
+
+	req := k6cloud.NewValidateOptionsRequest(k6Opts)
+	if projectID.Valid && projectID.Int64 > 0 {
+		pid := int32(projectID.Int64) //nolint:gosec // validated upstream
+		req.ProjectId = *k6cloud.NewNullableInt32(&pid)
+	}
+
+	return req, nil
 }
 
 func (c *cmdCloud) flagSet() *pflag.FlagSet {
@@ -500,15 +619,6 @@ func resolveAndSetProjectID(
 		arc.Options.External[cloudapi.LegacyCloudConfigKey] = b
 
 		cloudConfig.ProjectID = null.IntFrom(projectID)
-	}
-	if !cloudConfig.StackID.Valid || cloudConfig.StackID.Int64 == 0 {
-		fallBackMsg := ""
-		if !cloudConfig.ProjectID.Valid || cloudConfig.ProjectID.Int64 == 0 {
-			fallBackMsg = "Falling back to the first available stack. "
-		}
-		gs.Logger.Warn("DEPRECATED: No stack specified. " + fallBackMsg +
-			"Consider setting a default stack via the `k6 cloud login` command or the `K6_CLOUD_STACK_ID` " +
-			"environment variable as this will become mandatory in the next major release.")
 	}
 	return nil
 }
